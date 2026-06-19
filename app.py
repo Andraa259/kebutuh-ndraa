@@ -67,7 +67,7 @@ if uploaded_file is not None:
             if cols_count == 0 or rows_count == 0:
                 st.error("Ukuran stiker terlalu besar untuk ukuran kertas A4!")
             else:
-                st.info(Layout Terdeteksi: {rows_count} Baris x {cols_count} Kolom (Total {rows_count * cols_count} Stiker))
+                st.info(f"Layout Terdeteksi: {rows_count} Baris x {cols_count} Kolom (Total {rows_count * cols_count} Stiker)")
                 
                 # 5. Buat Tabel Sesuai Hitungan
                 table = doc.add_table(rows=rows_count, cols=cols_count)
