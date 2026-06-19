@@ -6,14 +6,13 @@ from docx.oxml.ns import qn
 from PIL import Image
 import io
 
-# Import untuk kebutuhan PDF generator secara native di server cloud
+# Library untuk PDF
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.units import cm
-from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Image as RLImage
-from reportlab.lib.styles import getSampleStyleSheet
+from reportlab.pdfgen import canvas
 
 def set_cell_margins(cell, top=0, bottom=0, left=0, right=0):
-    """Mengatur margin di dalam cell tabel menjadi 0 dxa agar pas dengan ukuran"""
+    """Mengatur margin internal cell tabel menjadi 0 agar ukuran gambar presisi"""
     tcPr = cell._tc.get_or_add_tcPr()
     tcMar = OxmlElement('w:tcMar')
     for m_name, m_val in [('top', top), ('bottom', bottom), ('left', left), ('right', right)]:
@@ -24,7 +23,7 @@ def set_cell_margins(cell, top=0, bottom=0, left=0, right=0):
     tcPr.append(tcMar)
 
 def remove_table_borders(table):
-    """Menghilangkan seluruh garis pembatas tabel di Word"""
+    """Menghilangkan garis tepi tabel di Word"""
     tblPr = table._tbl.tblPr
     tblBorders = OxmlElement('w:tblBorders')
     for border_name in ['top', 'left', 'bottom', 'right', 'insideH', 'insideV']:
@@ -35,155 +34,143 @@ def remove_table_borders(table):
 
 # --- Konfigurasi Halaman Streamlit ---
 st.set_page_config(page_title="Sticker Layout Generator", page_icon="🖨️")
-st.title("🖨️ Generator Layout Stiker A4 Pro")
-st.write("Layout stiker otomatis penuh satu lembar A4 dengan jeda horizontal antar stiker sebesar 1cm.")
+st.title("🖨️ Generator Layout Stiker A4 (Word & PDF)")
+st.write("Masukkan gambar stiker dan ukurannya. Sistem akan menyusunnya otomatis di kertas A4 dengan jeda 1 cm.")
 
 # --- Input User ---
-# Evaluasi 2: Menerima PNG, JPG, dan JPEG
-uploaded_file = st.file_uploader("Upload Gambar Stiker (PNG / JPG / JPEG)", type=["png", "jpg", "jpeg"])
-sticker_size_cm = st.number_input("Ukuran Sisi Stiker Persegi (cm)", min_value=1.0, max_value=20.0, value=5.0, step=0.1)
+uploaded_file = st.file_uploader("Upload Gambar Stiker (PNG / JPG)", type=["png", "jpg", "jpeg"])
+sticker_size_cm = st.number_input("Ukuran Sisi Stiker Persegi (cm)", min_value=1.0, max_value=15.0, value=5.0, step=0.1)
 
 if uploaded_file is not None:
+    # Membuka Gambar (Mendukung PNG & JPG)
     image = Image.open(uploaded_file)
-    st.image(image, caption="Preview Gambar Stiker", use_container_width=False, width=200)
+    st.image(image, caption="Preview Gambar Stiker", use_container_width=True)
     
-    # --- Perhitungan Matematika Layout dengan Jeda 1cm ---
-    printable_width = 21.0 - 2.0  # Total lebar area cetak (Margin kiri-kanan masing-masing 1cm)
-    printable_height = 29.7 - 2.0 # Total tinggi area cetak (Margin atas-bawah masing-masing 1cm)
-    gap_cm = 1.0                  # Jeda horizontal antar gambar
+    # 1. Parameter Dasar Lembar Kerja (A4 dengan Margin 1cm sekeliling)
+    margin_cm = 1.0
+    gap_cm = 1.0
+    printable_width = 21.0 - (2 * margin_cm)   # 19.0 cm
+    printable_height = 29.7 - (2 * margin_cm)  # 27.7 cm
     
-    # Menghitung jumlah kolom stiker yang muat dengan rumus: 
-    # (Lebar cetak + gap) // (Ukuran stiker + gap)
+    # 2. Hitung jumlah kolom & baris maksimal menggunakan rumus deret spasial:
+    # (count * size) + ((count - 1) * gap) <= printable_area
     cols_count = int((printable_width + gap_cm) // (sticker_size_cm + gap_cm))
-    rows_count = int(printable_height // sticker_size_cm)
+    rows_count = int((printable_height + gap_cm) // (sticker_size_cm + gap_cm))
     
-    # Hitung total kolom aktual pada struktur tabel Word (termasuk kolom spacer kosong)
-    total_word_cols = (cols_count * 2) - 1 if cols_count > 0 else 0
-    
-    if cols_count == 0 or rows_count == 0:
-        st.error("Ukuran stiker atau jeda terlalu besar untuk area kertas A4!")
+    # Proteksi jika ukuran terlalu besar
+    if cols_count <= 0 or rows_count <= 0:
+        st.error("Ukuran stiker terlalu besar untuk diletakkan di kertas A4 dengan jarak antar gambar 1 cm!")
     else:
-        st.info(f"📊 **Analisis Layout:** Terdeteksi {rows_count} Baris × {cols_count} Kolom Stiker (Total: {rows_count * cols_count} Stiker per Lembar).")
+        st.info(f"✨ Layout Optimal: **{rows_count} Baris** × **{cols_count} Kolom** (Total: {rows_count * cols_count} Stiker per halaman)")
         
-        # Buat pilihan format output
-        # Evaluasi 3: Pilihan format Word atau PDF
-        output_format = st.radio("Pilih Format Dokumen Output:", ("Microsoft Word (.docx)", "Portable Document Format (.pdf)"))
+        # Sediakan dua kolom tombol pilihan format output
+        col1, col2 = st.columns(2)
         
-        if st.button("Proses dan Ambil File"):
-            with st.spinner("Sedang menyusun layout stiker..."):
-                
-                # Standarisasi gambar ke byte stream agar aman dibaca docx/reportlab
-                img_byte_arr = io.BytesIO()
-                img_format = image.format if image.format else 'PNG'
-                image.save(img_byte_arr, format=img_format)
-                img_byte_arr.seek(0)
-                
-                # ----------------------------------------------------
-                # JALUR GENERATE WORD DENGAN JEDA HORIZONTAL
-                # ----------------------------------------------------
-                if output_format == "Microsoft Word (.docx)":
+        # --- PROSES GENERATE WORD ---
+        with col1:
+            if st.button("🚀 Buat File Word (.docx)", use_container_width=True):
+                with st.spinner("Menyusun layout Word..."):
                     doc = Document()
                     
-                    # Atur spesifikasi kertas A4 dan margin 1cm
+                    # Atur ukuran halaman A4 & Margin halaman
                     for section in doc.sections:
                         section.page_width = Cm(21.0)
                         section.page_height = Cm(29.7)
-                        section.top_margin = Cm(1.0)
-                        section.bottom_margin = Cm(1.0)
-                        section.left_margin = Cm(1.0)
-                        section.right_margin = Cm(1.0)
+                        section.top_margin = Cm(margin_cm)
+                        section.bottom_margin = Cm(margin_cm)
+                        section.left_margin = Cm(margin_cm)
+                        section.right_margin = Cm(margin_cm)
                     
-                    # Membuat tabel dengan kolom spacer terintegrasi
-                    table = doc.add_table(rows=rows_count, cols=total_word_cols)
+                    # Total kolom/baris tabel Word termasuk baris/kolom pembatas (spacer)
+                    word_cols = (cols_count * 2) - 1
+                    word_rows = (rows_count * 2) - 1
+                    
+                    table = doc.add_table(rows=word_rows, cols=word_cols)
                     remove_table_borders(table)
                     
-                    for r in range(rows_count):
-                        table.rows[r].height = Cm(sticker_size_cm)
+                    # Konversi gambar ke format byte buffer agar python-docx bisa membaca
+                    img_byte_arr = io.BytesIO()
+                    image.save(img_byte_arr, format='PNG')
+                    img_byte_arr.seek(0)
+                    
+                    # Atur dimensi grid tabel dan masukkan gambar
+                    for r in range(word_rows):
+                        is_row_gap = (r % 2 != 0)
+                        table.rows[r].height = Cm(gap_cm) if is_row_gap else Cm(sticker_size_cm)
                         
-                        stiker_idx = 0
-                        for c in range(total_word_cols):
+                        for c in range(word_cols):
+                            is_col_gap = (c % 2 != 0)
                             cell = table.cell(r, c)
                             set_cell_margins(cell)
                             
-                            if c % 2 == 0:
-                                # Kolom Genap: Tempat menaruh stiker
-                                cell.width = Cm(sticker_size_cm)
-                                paragraph = cell.paragraphs[0]
-                                run = paragraph.add_run()
-                                run.add_picture(img_byte_arr, width=Cm(sticker_size_cm), height=Cm(sticker_size_cm))
-                            else:
-                                # Kolom Ganjil: Sebagai pembatas horizontal (Spacer 1cm)
+                            if is_col_gap:
                                 cell.width = Cm(gap_cm)
-                                
-                    doc_buffer = io.BytesIO()
-                    doc.save(doc_buffer)
-                    doc_buffer.seek(0)
-                    
-                    st.success("File Word berhasil dibuat!")
-                    st.download_button(
-                        label="📥 Download File Word (.docx)",
-                        data=doc_buffer,
-                        file_name="layout_stiker.docx",
-                        mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document"
-                    )
-                
-                # ----------------------------------------------------
-                # JALUR GENERATE PDF NATIVE
-                # ----------------------------------------------------
-                else:
-                    pdf_buffer = io.BytesIO()
-                    # Setup dokumen dengan margin 1cm (1cm = ~28.34 points)
-                    margin = 1 * cm
-                    doc_pdf = SimpleDocTemplate(
-                        pdf_buffer, 
-                        pagesize=A4,
-                        leftMargin=margin, 
-                        rightMargin=margin, 
-                        topMargin=margin, 
-                        bottomMargin=margin
-                    )
-                    
-                    # Menyiapkan konfigurasi lebar kolom untuk tabel PDF
-                    col_widths = []
-                    for c in range(total_word_cols):
-                        if c % 2 == 0:
-                            col_widths.append(sticker_size_cm * cm)
-                        else:
-                            col_widths.append(gap_cm * cm)
-                    
-                    # Memasukkan element gambar ke dalam struktur matriks tabel PDF
-                    data_matrix = []
-                    for r in range(rows_count):
-                        row_data = []
-                        for c in range(total_word_cols):
-                            if c % 2 == 0:
-                                # Gunakan internal path/stream dari asset gambar
-                                img_flowable = RLImage(img_byte_arr, width=sticker_size_cm*cm, height=sticker_size_cm*cm)
-                                row_data.append(img_flowable)
                             else:
-                                row_data.append("") # Cell kosong untuk jeda horizontal
-                        data_matrix.append(row_data)
+                                cell.width = Cm(sticker_size_cm)
+                                # Jika ini bukan baris kosong maupun kolom kosong, tempatkan gambar
+                                if not is_row_gap:
+                                    paragraph = cell.paragraphs[0]
+                                    run = paragraph.add_run()
+                                    run.add_picture(img_byte_arr, width=Cm(sticker_size_cm), height=Cm(sticker_size_cm))
                     
-                    # Styling tabel PDF agar margin internal cell bernilai 0 dan tanpa garis
-                    pdf_table = Table(data_matrix, colWidths=col_widths, rowHeights=[sticker_size_cm*cm]*rows_count)
-                    pdf_table.setStyle(TableStyle([
-                        ('VALIGN', (0,0), (-1,-1), 'MIDDLE'),
-                        ('ALIGN', (0,0), (-1,-1), 'CENTER'),
-                        ('LEFTPADDING', (0,0), (-1,-1), 0),
-                        ('RIGHTPADDING', (0,0), (-1,-1), 0),
-                        ('TOPPADDING', (0,0), (-1,-1), 0),
-                        ('BOTTOMPADDING', (0,0), (-1,-1), 0),
-                    ]))
+                    # Simpan file ke memory buffer
+                    word_buffer = io.BytesIO()
+                    doc.save(word_buffer)
+                    word_buffer.seek(0)
                     
-                    # Bangun PDF ke dalam buffer memori RAM
-                    story = [pdf_table]
-                    doc_pdf.build(story)
+                    st.success("File Word siap diunduh!")
+                    st.download_button(
+                        label="📥 Download File Word",
+                        data=word_buffer,
+                        file_name="layout_stiker.docx",
+                        mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                        use_container_width=True
+                    )
+
+        # --- PROSES GENERATE PDF ---
+        with col2:
+            if st.button("🚀 Buat File PDF (.pdf)", use_container_width=True):
+                with st.spinner("Menyusun layout PDF..."):
+                    # Konversi gambar ke mode RGB jika gambar bertipe PNG transparan supaya ReportLab tidak error
+                    pdf_img = image.convert("RGB") if image.mode != "RGB" else image
+                    img_byte_arr = io.BytesIO()
+                    pdf_img.save(img_byte_arr, format='JPEG')
+                    img_byte_arr.seek(0)
+                    
+                    # Buat objek canvas reportlab di memory buffer
+                    pdf_buffer = io.BytesIO()
+                    c = canvas.Canvas(pdf_buffer, pagesize=A4)
+                    
+                    # Baca ukuran halaman A4 sesungguhnya dalam satuan poin internal ReportLab
+                    width_a4, height_a4 = A4 
+                    
+                    # Buat objek gambar ReportLab dari buffer objek Pillow Image
+                    from reportlab.lib.utils import ImageReader
+                    reader = ImageReader(img_byte_arr)
+                    
+                    # Gambar stiker dengan koordinat cartesius (titik 0,0 dimulai dari Kiri Bawah halaman)
+                    for r in range(rows_count):
+                        for col in range(cols_count):
+                            # Hitung posisi X dan Y dari sisi kiri dan atas kertas dalam cm
+                            pos_x_cm = margin_cm + (col * (sticker_size_cm + gap_cm))
+                            pos_y_cm = margin_cm + (r * (sticker_size_cm + gap_cm))
+                            
+                            # Konversikan centimeter ke unit ReportLab (points)
+                            # Karena sumbu Y ReportLab bergerak dari bawah ke atas, kita balik titik mulanya dari atas halaman
+                            x = pos_x_cm * cm
+                            y = height_a4 - (pos_y_cm * cm) - (sticker_size_cm * cm)
+                            
+                            c.drawImage(reader, x, y, width=sticker_size_cm*cm, height=sticker_size_cm*cm)
+                    
+                    c.showPage()
+                    c.save()
                     pdf_buffer.seek(0)
                     
-                    st.success("File PDF berhasil dibuat!")
+                    st.success("File PDF siap diunduh!")
                     st.download_button(
-                        label="📥 Download File PDF (.pdf)",
+                        label="📥 Download File PDF",
                         data=pdf_buffer,
                         file_name="layout_stiker.pdf",
-                        mime="application/pdf"
+                        mime="application/pdf",
+                        use_container_width=True
                     )
